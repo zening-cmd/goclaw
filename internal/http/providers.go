@@ -448,520 +448,84 @@ var localURLProviderTypes = map[string]bool{
 // allowedLocalHosts are the only hosts permitted for local provider types.
 // Explicit allowlist (not blocklist) to prevent new internal addresses from
 // slipping through (e.g. 169.254.169.254 via ollama base URL).
-var allowedLocalHosts = []string{"localhost", "127.0.0.1", "::1", "host.docker.internal"}
-
-// dnsResolverFn resolves hostnames to IPs. Replaceable in tests.
-var dnsResolverFn = net.LookupHost
-
-// allowPrivateProviderURLsFn reports whether the operator has opted in to
-// permitting private / loopback / link-local / internal-hostname provider base
-// URLs via GOCLAW_ALLOW_PRIVATE_PROVIDER_URLS. Evaluated once at first call so
-// tests can override the variable before that happens.
-var allowPrivateProviderURLsFn = sync.OnceValue(func() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("GOCLAW_ALLOW_PRIVATE_PROVIDER_URLS")))
-	return v == "1" || v == "true" || v == "yes"
-})
-
-// ollamaAllowedHostsFn returns the operator-configured extra hosts permitted
-// for local provider types (ollama, acp) via GOCLAW_OLLAMA_ALLOWED_HOSTS
-// (comma-separated hostnames/IPs, e.g. "192.168.3.31,ollama.lan"). These are
-// added on top of allowedLocalHosts, allowing LAN-hosted Ollama servers.
-// Evaluated once at first call so tests can override the variable before that happens.
-var ollamaAllowedHostsFn = sync.OnceValue(func() []string {
-	raw := os.Getenv("GOCLAW_OLLAMA_ALLOWED_HOSTS")
-	if raw == "" {
-		return nil
-	}
-	parts := strings.Split(raw, ",")
-	hosts := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			hosts = append(hosts, p)
-		}
-	}
-	return hosts
-})
-
-// validateProviderURL rejects provider base URLs pointing to internal/private networks.
-// Defense-in-depth: prevents SSRF when providers are later used for API calls.
-//
-// Logic:
-//  1. Empty URL → allowed (provider may not need a custom base).
-//  2. Claude CLI → api_base is an executable path/command, not a URL.
-//  3. Scheme check (http/https only) → enforced for URL-based types, including
-//     local URL types. Blocks file://, gopher://, dict://, etc.
-//  4. Local URL types (ollama, acp) → host must be in allowedLocalHosts, or in
-//     the operator-configured GOCLAW_OLLAMA_ALLOWED_HOSTS list (explicit
-//     allowlist prevents reaching 169.254.169.254 or internal services via the
-//     local-type bypass, while still allowing LAN-hosted Ollama servers).
-//  5. Remote types → if GOCLAW_ALLOW_PRIVATE_PROVIDER_URLS is set, allow and log.
-//     Otherwise: resolve DNS hostname; reject if ANY resolved IP satisfies
-//     security.IsBlocked (covers loopback, link-local, private, multicast,
-//     unspecified — including 0.0.0.0 and :: that earlier hand-rolled checks missed).
-//
-// DNS resolution on step 5 closes the nip.io / sslip.io / attacker-domain bypass
-// where a hostname passes a literal-string blocklist but resolves to a private IP.
-func validateProviderURL(rawURL string, providerType string) error {
-	if rawURL == "" {
-		return nil
-	}
-	if providerType == store.ProviderClaudeCLI {
-		return validateClaudeCLIExecutablePath(rawURL)
-	}
-	if providerType == store.ProviderACP {
-		return validateACPExecutablePath(rawURL)
-	}
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return fmt.Errorf("invalid URL: %w", err)
-	}
-	// Scheme check is unconditional for URL-based provider types, including local URL types.
-	switch u.Scheme {
-	case "http", "https":
-	default:
-		return fmt.Errorf("provider URL must use http or https scheme, got %q", u.Scheme)
-	}
-
-	host := u.Hostname()
-
-	// Local provider types: only allow an explicit localhost allowlist.
-	// This prevents using the local-type escape hatch to reach internal services
-	// or cloud metadata endpoints.
-	if localURLProviderTypes[providerType] {
-		for _, a := range allowedLocalHosts {
-			if strings.EqualFold(host, a) {
-				return nil
-			}
-		}
-		for _, a := range ollamaAllowedHostsFn() {
-			if strings.EqualFold(host, a) {
-				return nil
-			}
-		}
-		slog.Warn("security.provider_url.local_type_denied", "host", host, "provider_type", providerType)
-		return fmt.Errorf("provider type %q only allows localhost URLs (localhost, 127.0.0.1, ::1, host.docker.internal, or GOCLAW_OLLAMA_ALLOWED_HOSTS), got host %q", providerType, host)
-	}
-
-	// Operator opt-in to allow private-network provider URLs (e.g. LAN-hosted vLLM).
-	// Scheme check above still applies even with this gate open.
-	if allowPrivateProviderURLsFn() {
-		slog.Warn("security.provider_url.private_allowed", "host", host, "provider_type", providerType)
-		return nil
-	}
-
-	// Check literal IP first (avoids unnecessary DNS lookup).
-	if ip := net.ParseIP(host); ip != nil {
-		if security.IsBlocked(ip) {
-			slog.Warn("security.provider_url.blocked", "host", host, "provider_type", providerType)
-			return fmt.Errorf("provider URL cannot point to %s", host)
-		}
-		return nil
-	}
-
-	// Block .internal / .local suffix before DNS (fail-fast for well-known patterns).
-	if strings.HasSuffix(host, ".internal") || strings.HasSuffix(host, ".local") {
-		slog.Warn("security.provider_url.blocked", "host", host, "provider_type", providerType)
-		return fmt.Errorf("provider URL cannot point to internal hostname: %s", host)
-	}
-
-	// Resolve DNS and check every returned address.
-	// Prevents bypass via wildcard services (nip.io, sslip.io) or attacker-controlled
-	// domains that map to private IPs (DNS-rebinding at config time).
-	addrs, err := dnsResolverFn(host)
-	if err != nil {
-		slog.Warn("security.provider_url.dns_resolve_failed", "host", host, "provider_type", providerType, "error", err)
-		return fmt.Errorf("provider URL hostname %q could not be resolved: %w", host, err)
-	}
-	for _, addr := range addrs {
-		ip := net.ParseIP(addr)
-		if ip == nil {
-			continue
-		}
-		if security.IsBlocked(ip) {
-			slog.Warn("security.provider_url.blocked_resolved", "host", host, "resolved_ip", ip.String(), "provider_type", providerType)
-			return fmt.Errorf("provider URL %q resolves to private/reserved address %s", host, ip)
-		}
-	}
-	return nil
-}
-
-func validateClaudeCLIExecutablePath(path string) error {
-	if strings.Contains(path, "\x00") {
-		return fmt.Errorf("Claude CLI executable path cannot contain NUL byte")
-	}
-	if _, err := url.ParseRequestURI(path); err == nil && strings.Contains(path, "://") {
-		return fmt.Errorf("Claude CLI api_base must be an executable path or %q, got URL %q", "claude", path)
-	}
-	if path == "claude" || filepath.IsAbs(path) {
-		return nil
-	}
-	return fmt.Errorf("Claude CLI api_base must be %q or an absolute executable path, got %q", "claude", path)
-}
-
-// validateACPExecutablePath validates that api_base for ACP providers carries a
-// command or absolute executable path, not a URL. This mirrors the runtime
-// registration logic in cmd/gateway_providers.go.
-func validateACPExecutablePath(path string) error {
-	if strings.Contains(path, "\x00") {
-		return fmt.Errorf("ACP binary path cannot contain NUL byte")
-	}
-	if _, err := url.ParseRequestURI(path); err == nil && strings.Contains(path, "://") {
-		return fmt.Errorf("ACP api_base must be an executable path or command, got URL %q", path)
-	}
-	// Keep parity with registerACPFromDB: built-in command names or absolute paths.
-	if path == "claude" || path == "codex" || path == "gemini" || filepath.IsAbs(path) {
-		return nil
-	}
-	return fmt.Errorf("ACP api_base must be %q, %q, %q, or an absolute executable path, got %q", "claude", "codex", "gemini", path)
-}
-
-// --- Provider CRUD ---
-
-func (h *ProvidersHandler) handleListProviders(w http.ResponseWriter, r *http.Request) {
-	providers, err := h.store.ListProviders(r.Context())
-	if err != nil {
-		slog.Error("providers.list", "error", err)
-		locale := extractLocale(r)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": i18n.T(locale, i18n.MsgFailedToList, "providers")})
-		return
-	}
-
-	for i := range providers {
-		maskAPIKey(&providers[i])
-	}
-
-	publicProviders := make([]store.LLMProviderData, 0, len(providers))
-	for i := range providers {
-		publicProviders = append(publicProviders, canonicalizeProviderForResponse(&providers[i]))
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"providers": publicProviders})
-}
-
-func (h *ProvidersHandler) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
-	locale := extractLocale(r)
-	var p store.LLMProviderData
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&p); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
-		return
-	}
-
-	if p.Name == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgRequired, "name")})
-		return
-	}
-	if !isValidSlug(p.Name) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidSlug, "name")})
-		return
-	}
-	if !store.ValidProviderTypes[p.ProviderType] {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, "unsupported provider_type")})
-		return
-	}
-
-	// Only one Claude CLI provider is allowed per instance (1 machine = 1 auth session).
-	// Mutex serializes check+create to prevent TOCTOU race.
-	if p.ProviderType == store.ProviderClaudeCLI {
-		h.cliMu.Lock()
-		defer h.cliMu.Unlock()
-
-		existing, _ := h.store.ListProviders(r.Context())
-		for _, ep := range existing {
-			if ep.ProviderType == store.ProviderClaudeCLI {
-				writeJSON(w, http.StatusConflict, map[string]string{
-					"error": i18n.T(locale, i18n.MsgAlreadyExists, "Claude CLI provider", "only one is allowed per instance"),
-				})
-				return
-			}
-		}
-	}
-
-	if err := validateChatGPTOAuthProviderCandidate(r.Context(), h.store, uuid.Nil, &p); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	if err := validateProviderEmbeddingSettings(&p); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, err.Error())})
-		return
-	}
-
-	if err := validateProviderURL(p.APIBase, p.ProviderType); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-
-	// Normalize Ollama base URL to include /v1 so all code paths
-	// (chat, model listing, embedding verify) use the same value from DB.
-	normalizeOllamaAPIBase(&p)
-
-	if err := h.store.CreateProvider(r.Context(), &p); err != nil {
-		slog.Error("providers.create", "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-
-	// Register in-memory so verify/chat work without restart
-	h.registerInMemory(&p)
-	h.emitProviderCacheInvalidate(r.Context(), p.TenantID, p.Name)
-
-	emitAudit(h.msgBus, r, "provider.created", "provider", p.ID.String())
-	maskAPIKey(&p)
-	publicProvider := canonicalizeProviderForResponse(&p)
-	writeJSON(w, http.StatusCreated, publicProvider)
-}
-
-func (h *ProvidersHandler) handleGetProvider(w http.ResponseWriter, r *http.Request) {
-	locale := extractLocale(r)
-	id, err := uuid.Parse(r.PathValue("id"))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "provider")})
-		return
-	}
-
-	p, err := h.store.GetProvider(r.Context(), id)
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": i18n.T(locale, i18n.MsgNotFound, "provider", id.String())})
-		return
-	}
-
-	maskAPIKey(p)
-	publicProvider := canonicalizeProviderForResponse(p)
-	writeJSON(w, http.StatusOK, publicProvider)
-}
-
-func (h *ProvidersHandler) handleReconnectProvider(w http.ResponseWriter, r *http.Request) {
-	locale := extractLocale(r)
-	id, err := uuid.Parse(r.PathValue("id"))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "provider")})
-		return
-	}
-
-	var req struct {
-		Verify bool `json:"verify"`
-	}
-	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
-			return
-		}
-		if req.Verify {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, "verify is not supported by reconnect; call provider verify separately")})
-			return
-		}
-	}
-
-	p, err := h.store.GetProvider(r.Context(), id)
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": i18n.T(locale, i18n.MsgNotFound, "provider", id.String())})
-		return
-	}
-
-	if h.providerReg != nil {
-		h.providerReg.UnregisterForTenant(p.TenantID, p.Name)
-	}
-
-	status := "disabled"
-	registryUpdated := false
-	if p.Enabled {
-		switch h.registerInMemory(p) {
-		case providerRuntimeRegistered:
-			status = "reconnected"
-			registryUpdated = true
-		default:
-			status = "not_registered"
-		}
-	}
-	cacheInvalidated := h.emitProviderCacheInvalidate(r.Context(), p.TenantID, p.Name)
-	emitAudit(h.msgBus, r, "provider.reconnected", "provider", p.ID.String())
-
-	maskAPIKey(p)
-	publicProvider := canonicalizeProviderForResponse(p)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":            status,
-		"provider":          publicProvider,
-		"registry_updated":  registryUpdated,
-		"cache_invalidated": cacheInvalidated,
-	})
-}
-
-func (h *ProvidersHandler) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
-	locale := extractLocale(r)
-	id, err := uuid.Parse(r.PathValue("id"))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "provider")})
-		return
-	}
-
-	var updates map[string]any
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&updates); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
-		return
-	}
-
-	// Validate name if being updated
-	if name, ok := updates["name"]; ok {
-		if s, _ := name.(string); !isValidSlug(s) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidSlug, "name")})
-			return
-		}
-	}
-
-	// Strip masked API key — don't overwrite real value with "***"
-	if apiKey, ok := updates["api_key"]; ok {
-		if s, _ := apiKey.(string); s == "***" || s == "" {
-			delete(updates, "api_key")
-		}
-	}
-
-	// Allowlist: only permit known provider columns.
-	updates = filterAllowedKeys(updates, providerAllowedFields)
-
-	currentProvider, err := h.store.GetProvider(r.Context(), id)
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": i18n.T(locale, i18n.MsgNotFound, "provider", id.String())})
-		return
-	}
-
-	candidate := *currentProvider
-	if name, ok := updates["name"].(string); ok && name != "" {
-		candidate.Name = name
-	}
-	if apiKey, ok := updates["api_key"].(string); ok {
-		candidate.APIKey = apiKey
-	}
-	if apiBase, ok := updates["api_base"].(string); ok {
-		candidate.APIBase = apiBase
-	}
-	if enabled, ok := updates["enabled"].(bool); ok {
-		candidate.Enabled = enabled
-	}
-	if displayName, ok := updates["display_name"].(string); ok {
-		candidate.DisplayName = displayName
-	}
-	if pt, ok := updates["provider_type"].(string); ok && pt != "" {
-		candidate.ProviderType = pt
-	}
-	if settings, ok := updates["settings"]; ok {
-		rawSettings, err := marshalJSONRaw(settings)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
-			return
-		}
-		candidate.Settings = rawSettings
-		updates["settings"] = rawSettings
-	}
-
-	// Re-validate URLs against the (possibly new) provider type.
-	// When provider_type changes, existing api_base must also pass validation
-	// for the new type — prevents SSRF via ACP→non-ACP type switch.
-	typeChanged := candidate.ProviderType != currentProvider.ProviderType
-
-	if apiBase, ok := updates["api_base"]; ok {
-		if s, _ := apiBase.(string); s != "" {
-			if err := validateProviderURL(s, candidate.ProviderType); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-				return
-			}
-		}
-	} else if typeChanged && candidate.APIBase != "" {
-		if err := validateProviderURL(candidate.APIBase, candidate.ProviderType); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-	}
-	if baseURL, ok := updates["base_url"]; ok {
-		if s, _ := baseURL.(string); s != "" {
-			if err := validateProviderURL(s, candidate.ProviderType); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-				return
-			}
-		}
-	}
-
-	// Normalize Ollama base URL to include /v1 so all code paths use the same value.
-	normalizeOllamaAPIBase(&candidate)
-	if candidate.APIBase != currentProvider.APIBase {
-		updates["api_base"] = candidate.APIBase
-	}
-
-	if err := validateChatGPTOAuthProviderCandidate(r.Context(), h.store, id, &candidate); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	if err := validateProviderEmbeddingSettings(&candidate); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, err.Error())})
-		return
-	}
-
-	// Track old name before update for registry cleanup
-	var oldName string
-	if h.providerReg != nil {
-		oldName = currentProvider.Name
-	}
-
-	if err := h.store.UpdateProvider(r.Context(), id, updates); err != nil {
-		slog.Error("providers.update", "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-
-	// Sync in-memory registry with updated provider
-	if h.providerReg != nil {
-		if updated, err := h.store.GetProvider(r.Context(), id); err == nil {
-			// Unregister old name if renamed to prevent ghost entries
-			if oldName != "" && oldName != updated.Name {
-				h.providerReg.UnregisterForTenant(updated.TenantID, oldName)
-			}
-			if !updated.Enabled {
-				h.providerReg.UnregisterForTenant(updated.TenantID, updated.Name)
-			} else {
-				h.registerInMemory(updated)
-			}
-		}
-	}
-
-	// Notify subscribers (e.g. ACP re-registration) about the change
-	if updated, err := h.store.GetProvider(r.Context(), id); err == nil {
-		h.emitProviderCacheInvalidate(r.Context(), updated.TenantID, updated.Name)
-		if oldName != "" && oldName != updated.Name {
-			h.emitProviderCacheInvalidate(r.Context(), updated.TenantID, oldName)
-		}
-	}
-
-	emitAudit(h.msgBus, r, "provider.updated", "provider", id.String())
-	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
-}
-
-func (h *ProvidersHandler) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
-	locale := extractLocale(r)
-	id, err := uuid.Parse(r.PathValue("id"))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "provider")})
-		return
-	}
-
-	// Read provider before deleting so we can unregister it
-	var providerName string
-	var providerTenantID uuid.UUID
-	if p, err := h.store.GetProvider(r.Context(), id); err == nil {
-		providerName = p.Name
-		providerTenantID = p.TenantID
-	}
-
-	if err := h.store.DeleteProvider(r.Context(), id); err != nil {
-		slog.Error("providers.delete", "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-
-	if h.providerReg != nil && providerName != "" {
-		h.providerReg.UnregisterForTenant(providerTenantID, providerName)
-	}
-	if providerName != "" {
-		h.emitProviderCacheInvalidate(r.Context(), providerTenantID, providerName)
-	}
-
-	emitAudit(h.msgBus, r, "provider.deleted", "provider", id.String())
-	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
-}
+var allowedLocalHosts = []stri�^���춻�q�^t�ѡ�����Ʌѽȵ�������ɕ�����Ʉ�����́��ɵ��ѕ�(�����ȁ�������ɽ٥��ȁ����̀��������������٥��=
+1]}=115}11=]}!=MQL(����������͕��Ʌѕ�����ѹ���̽%A̰���������ȸ���̸�ı��������������Q��͔��ɔ(������������ѽ���������ݕ�1����!���̰�����ݥ���18����ѕ��=������͕�ٕ�̸(���م�Յѕ��������Ё����Ё�����ͼ�ѕ��́�����ٕ�ɥ���ѡ��مɥ���������ɔ�ѡ�Ё������̸)مȁ���������ݕ�!��������幌�=���Y��Ք��չ����mu��ɥ����(%Ʌ܀��̹�ѕ�ؠ�=
+1]}=115}11=]}!=MQL��(%���Ʌ܀�􀈈��($%ɕ��ɸ����(%�(%����̀����ɥ��̹M���СɅܰ�����(%����̀�􁵅���mu��ɥ���������������̤�(%��ȁ|������Ʌ��������́�($%�����ɥ��̹Qɥ�M�������($%������􀈈��($$%����̀�����������̰���($%�(%�(%ɕ��ɸ������)��((���م����ѕAɽ٥���UI0�ɕ����́�ɽ٥��ȁ��͔�UI1́����ѥ���Ѽ���ѕɹ����ɥمє����ݽɭ̸(�������͔�������Ѡ��ɕٕ��́MMI�ݡ����ɽ٥���́�ɔ���ѕȁ�͕����ȁA$�����̸(��(���1�����(����ĸ�����UI0��H�����ݕ����ɽ٥��ȁ��䁹�Ё����������ѽ����͔��(����ȸ�
+��Ց��
+1$��H����}��͔��́����ᕍ�х������Ѡ������������Ё��UI0�(����̸�M����������������������́���䤃�H�����ɍ�����ȁUI0���͕������̰�����Ց���(�������������UI0�����̸�	����́����輼��������輼������輼���ь�(����и�1�����UI0�����̀���������������H����Ё���Ё����������ݕ�1����!���̰��ȁ��(�������ѡ�����Ʌѽȵ�������ɕ��=
+1]}=115}11=]}!=MQL����Ѐ���������(�����������ݱ��Ё�ɕٕ��́ɕ������������и�����Ё�ȁ��ѕɹ���͕�٥��́٥��ѡ�(�����������������������̰�ݡ�����ѥ�������ݥ���18����ѕ��=������͕�ٕ�̤�(����Ը�I���є�����̃�H����=
+1]}11=]}AI%YQ}AI=Y%I}UI1L��͕́а�����܁��������(�������=ѡ��ݥ͔�ɕͽ�ٔ�9L����ѹ����ɕ���Ё���9d�ɕͽ�ٕ��%@�ͅѥ͙���(�������͕��ɥ��%�	����������ٕ�́�����������������������ɥمє���ձѥ���а(�������չ�����������P�����Ց������������������ѡ�Ё��ɱ��ȁ�����ɽ����������́���͕���(��(���9L�ɕͽ��ѥ�������ѕ��ԁ���͕́ѡ������������ͱ����������х���ȵ�������������(���ݡ�ɔ������ѹ�������͕́����ѕɅ����ɥ�����������Ё��Ёɕͽ�ٕ́Ѽ����ɥمє�%@�)�չ��م����ѕAɽ٥���UI0�Ʌ�UI0���ɥ�����ɽ٥���Q������ɥ������ɽȁ�(%���Ʌ�UI0��􀈈��($%ɕ��ɸ����(%�(%����ɽ٥���Q�������ѽɔ�Aɽ٥���
+��Ց�
+1$��($%ɕ��ɸ�م����ѕ
+��Ց�
+1%ᕍ�х���A�Ѡ�Ʌ�UI0�(%�(%����ɽ٥���Q�������ѽɔ�Aɽ٥���
+@��($%ɕ��ɸ�م����ѕ
+Aᕍ�х���A�Ѡ�Ʌ�UI0�(%�(%԰���Ȁ���ɰ�A��͔�Ʌ�UI0�(%�����Ȁ�􁹥���($%ɕ��ɸ���й�ɽɘ����م����UI0耕܈����Ȥ(%�($���M�������������́չ�����ѥ�������ȁUI0���͕���ɽ٥��ȁ����̰�����Ց����������UI0�����̸(%�ݥэ��ԹM�������(%��͔��������������̈�(%����ձ��($%ɕ��ɸ���й�ɽɘ���ɽ٥��ȁUI0����Ё�͔�������ȁ����͍́��������Ѐ�Ĉ��ԹM������(%�((%���Ѐ��Թ!��ѹ�����(($���1������ɽ٥��ȁ�����聽��䁅���܁����������Ё��������Ё����ݱ��и($���Q��́�ɕٕ��́�ͥ���ѡ��������������͍������э��Ѽ�ɕ������ѕɹ���͕�٥���($����ȁ���Ր���х��ф���������̸(%��������UI1Aɽ٥���Q����m�ɽ٥���Q���t��($%��ȁ|������Ʌ��������ݕ�1����!���́�($$%�����ɥ��̹�Յ��������а�����($$$%ɕ��ɸ����($$%�($%�($%��ȁ|������Ʌ�������������ݕ�!���������($$%�����ɥ��̹�Յ��������а�����($$$%ɕ��ɸ����($$%�($%�($%ͱ���]�ɸ��͕��ɥ���ɽ٥���}�ɰ������}����}�������������Ј�����а���ɽ٥���}��������ɽ٥���Q����($%ɕ��ɸ���й�ɽɘ���ɽ٥��ȁ������ā���䁅����́��������ЁUI1̀���������а���ܸ����İ���İ����й�����ȹ��ѕɹ�����ȁ=
+1]}=115}11=]}!=MQL�����Ё���Ѐ�Ĉ���ɽ٥���Q��������Ф(%�(($���=��Ʌѽȁ��е���Ѽ�����܁�ɥمє����ݽɬ��ɽ٥��ȁUI1̀������18����ѕ���114��($���M���������������ٔ��ѥ���������́�ٕ��ݥѠ�ѡ�́��є������(%��������AɥمѕAɽ٥���UI1������($%ͱ���]�ɸ��͕��ɥ���ɽ٥���}�ɰ��ɥمѕ}����ݕ��������Ј�����а���ɽ٥���}��������ɽ٥���Q����($%ɕ��ɸ����(%�(($���
+�������ѕɅ��%@�����Ѐ��ٽ��́չ�����ͅ��9L���������(%�������􁹕йA��͕%@����Ф쁥���􁹥���($%���͕��ɥ��%�	������������($$%ͱ���]�ɸ��͕��ɥ���ɽ٥���}�ɰ���������������Ј�����а���ɽ٥���}��������ɽ٥���Q����($$%ɕ��ɸ���й�ɽɘ���ɽ٥��ȁUI0������Ё����ЁѼ��̈�����Ф($%�($%ɕ��ɸ����(%�(($���	��������ѕɹ�������������ՙ��������ɔ�9L����������Ё��ȁݕ������ݸ����ѕɹ̤�(%�����ɥ��̹!��Mՙ��ࡡ��а�����ѕɹ����������ɥ��̹!��Mՙ��ࡡ��а������������($%ͱ���]�ɸ��͕��ɥ���ɽ٥���}�ɰ���������������Ј�����а���ɽ٥���}��������ɽ٥���Q����($%ɕ��ɸ���й�ɽɘ���ɽ٥��ȁUI0������Ё����ЁѼ���ѕɹ������ѹ���耕̈�����Ф(%�(($���I�ͽ�ٔ�9L������������ٕ��ɕ��ɹ������ɕ�̸($���Aɕٕ��́�����́٥��ݥ����ɐ�͕�٥��̀����������ͱ��������ȁ��х���ȵ����ɽ����($���������́ѡ�Ё����Ѽ��ɥمє�%À�9L�ɕ���������Ё�������ѥ����(%����̰���Ȁ�􁑹�I�ͽ�ٕ������Ф(%�����Ȁ�􁹥���($%ͱ���]�ɸ��͕��ɥ���ɽ٥���}�ɰ����}ɕͽ�ٕ}�������������Ј�����а���ɽ٥���}��������ɽ٥���Q��������ɽȈ����Ȥ($%ɕ��ɸ���й�ɽɘ���ɽ٥��ȁUI0����ѹ�����ā��ձ����Ё���ɕͽ�ٕ�耕܈�����а���Ȥ(%�(%��ȁ|�����Ȁ��Ʌ��������́�($%����􁹕йA��͕%@����Ȥ($%�������􁹥���($$%���ѥ�Ք($%�($%���͕��ɥ��%�	������������($$%ͱ���]�ɸ��͕��ɥ���ɽ٥���}�ɰ��������}ɕͽ�ٕ��������Ј�����а��ɕͽ�ٕ�}��������M�ɥ��������ɽ٥���}��������ɽ٥���Q����($$%ɕ��ɸ���й�ɽɘ���ɽ٥��ȁUI0��āɕͽ�ٕ́Ѽ��ɥمє�ɕ͕�ٕ�����ɕ�̀�̈�����а����($%�(%�(%ɕ��ɸ����)�()�չ��م����ѕ
+��Ց�
+1%ᕍ�х���A�Ѡ���Ѡ���ɥ������ɽȁ�(%�����ɥ��̹
+��х��̡��Ѡ���q�������($%ɕ��ɸ���й�ɽɘ��
+��Ց��
+1$��ᕍ�х������Ѡ������Ё���х���9U0���є��(%�(%���|����Ȁ���ɰ�A��͕I��Օ��UI$���Ѡ�쁕�Ȁ�􁹥�������ɥ��̹
+��х��̡��Ѡ���輼����($%ɕ��ɸ���й�ɽɘ��
+��Ց��
+1$����}��͔����Ё�������ᕍ�х������Ѡ��Ȁ�İ���ЁUI0��Ĉ������Ց������Ѡ�(%�(%�����Ѡ��􀉍��Ց������������Ѡ�%��̡��Ѡ���($%ɕ��ɸ����(%�(%ɕ��ɸ���й�ɽɘ��
+��Ց��
+1$����}��͔����Ё����ā�ȁ�����ͽ��є��ᕍ�х������Ѡ����Ѐ�Ĉ������Ց������Ѡ�)�((���م����ѕ
+Aᕍ�х���A�Ѡ�م����ѕ́ѡ�Ё���}��͔���ȁ
+@��ɽ٥���́���ɥ�́�(������������ȁ��ͽ��є��ᕍ�х������Ѡ����Ё��UI0��Q��́���ɽ�́ѡ���չѥ��(���ɕ����Ʌѥ������������������ѕ݅�}�ɽ٥���̹���)�չ��م����ѕ
+Aᕍ�х���A�Ѡ���Ѡ���ɥ������ɽȁ�(%�����ɥ��̹
+��х��̡��Ѡ���q�������($%ɕ��ɸ���й�ɽɘ��
+@���������Ѡ������Ё���х���9U0���є��(%�(%���|����Ȁ���ɰ�A��͕I��Օ��UI$���Ѡ�쁕�Ȁ�􁹥�������ɥ��̹
+��х��̡��Ѡ���輼����($%ɕ��ɸ���й�ɽɘ��
+@����}��͔����Ё�������ᕍ�х������Ѡ��ȁ�����������ЁUI0��Ĉ����Ѡ�(%�($���-������ɥ��ݥѠ�ɕ���ѕ�
+Aɽ�聉ե�е���������������́�ȁ��ͽ��є���ѡ̸(%�����Ѡ��􀉍��Ց��������Ѡ��􀉍�����������Ѡ��􀉝����������������Ѡ�%��̡��Ѡ���($%ɕ��ɸ����(%�(%ɕ��ɸ���й�ɽɘ��
+@����}��͔����Ё����İ��İ��İ��ȁ�����ͽ��є��ᕍ�х������Ѡ����Ѐ�Ĉ������Ց�������������������������Ѡ�)�((�������Aɽ٥��ȁ
+IU����()�չ������Aɽ٥����!�����Ȥ�������1���Aɽ٥���̡܁�����I�����͕]ɥѕȰ�Ȁ������I��Օ�Ф��(%�ɽ٥���̰���Ȁ�􁠹�ѽɔ�1���Aɽ٥���̡ȹ
+��ѕ�Р��(%�����Ȁ�􁹥���($%ͱ����ɽȠ��ɽ٥���̹���Ј�����ɽȈ����Ȥ($%�����������Ʌ��1������Ȥ($%�ɥѕ)M=8�ܰ������Mх���%�ѕɹ��M��ٕ��ɽȰ����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝�����Q�1��а���ɽ٥���̈���($%ɕ��ɸ(%�((%��ȁ����Ʌ�����ɽ٥���́�($%��ͭA%-�䠙�ɽ٥����m�t�(%�((%�Չ���Aɽ٥���̀�􁵅���mu�ѽɔ�115Aɽ٥����ф����������ɽ٥���̤�(%��ȁ����Ʌ�����ɽ٥���́�($%�Չ���Aɽ٥���̀��������Չ���Aɽ٥���̰������������Aɽ٥�����I�����͔���ɽ٥����m�t��(%�(%�ɥѕ)M=8�ܰ������Mх���=,�����m��ɥ��u�����ɽ٥���̈��Չ���Aɽ٥������)�()�չ������Aɽ٥����!�����Ȥ�������
+ɕ�ѕAɽ٥��ȡ܁�����I�����͕]ɥѕȰ�Ȁ������I��Օ�Ф��(%�����������Ʌ��1������Ȥ(%مȁ���ѽɔ�115Aɽ٥����ф(%�����Ȁ��ͽ��9�������ȡ�����5��	�ѕ�I����ȡܰ�ȹ	��䰀�����������������쁕�Ȁ�􁹥���($%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝%�م���)M=8���($%ɕ��ɸ(%�((%�����9�����􀈈��($%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝I��եɕ������������($%ɕ��ɸ(%�(%������Y����M�՜���9������($%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝%�م���M�՜�����������($%ɕ��ɸ(%�(%��Aɽ٥���Q������ѽɔ�9�ɵ����Aɽ٥���Q������Aɽ٥���Q����(%�����ѽɔ�Y����Aɽ٥���Q����m��Aɽ٥���Q���t��($%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝%�م���I��Օ�а��չ������ѕ���ɽ٥���}��������($%ɕ��ɸ(%�(($���=��䁽���
+��Ց��
+1$��ɽ٥��ȁ�́����ݕ����ȁ���х�����ā���������ā��Ѡ�͕�ͥ����($���5�ѕ��͕ɥ����́�������ɕ�є�Ѽ��ɕٕ�ЁQ=
+Q=T�Ʌ���(%�����Aɽ٥���Q�������ѽɔ�Aɽ٥���
+��Ց�
+1$��($%�����5Թ1�����($%����ȁ�����5ԹU�������(($%���ѥ����|��􁠹�ѽɔ�1���Aɽ٥���̡ȹ
+��ѕ�Р��($%��ȁ|�������Ʌ�������ѥ����($$%������Aɽ٥���Q�������ѽɔ�Aɽ٥���
+��Ց�
+1$��($$$%�ɥѕ)M=8�ܰ������Mх���
+������а����m��ɥ��u��ɥ���($$$$$���ɽȈ聤�ḹP�����������ḹ5͝�ɕ������̰��
+��Ց��
+1$��ɽ٥��Ȉ������䁽����́����ݕ����ȁ���х������($$$%��($$$%ɕ��ɸ($$%�($%�(%�((%�����Ȁ��م����ѕ
+���AQ=�ѡAɽ٥���
+������є�ȹ
+��ѕ�Р������ѽɔ���ե��9�������쁕�Ȁ�􁹥���($%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聕�ȹ�ɽȠ���($%ɕ��ɸ(%�(%�����Ȁ��م����ѕAɽ٥�����������M��ѥ��̠���쁕�Ȁ�􁹥���($%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝%�م���I��Օ�а���ȹ�ɽȠ����($%ɕ��ɸ(%�((%�����Ȁ��م����ѕAɽ٥���UI0���A%	�͔����Aɽ٥���Q����쁕�Ȁ�􁹥���($%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聕�ȹ�ɽȠ���($%ɕ��ɸ(%�(($���9�ɵ���锁=��������͔�UI0�Ѽ�����Ց����āͼ������������ѡ�($�������а����������ѥ��������������ٕɥ�䤁�͔�ѡ��ͅ���م�Ք��ɽ���(%��ɵ����=�����A%	�͔����((%�����Ȁ�􁠹�ѽɔ�
+ɕ�ѕAɽ٥��ȡȹ
+��ѕ�Р������쁕�Ȁ�􁹥���($%ͱ����ɽȠ��ɽ٥���̹�ɕ�є������ɽȈ����Ȥ($%�ɥѕ)M=8�ܰ������Mх���%�ѕɹ��M��ٕ��ɽȰ����m��ɥ��u��ɥ��쉕�ɽȈ聕�ȹ�ɽȠ���($%ɕ��ɸ(%�(($���I����ѕȁ���������ͼ�ٕɥ�位��Ёݽɬ�ݥѡ��Ёɕ�х��(%��ɕ���ѕ�%�5����䠙��(%������Aɽ٥���
+����%�م����є�ȹ
+��ѕ�Р�����Q�����%����9����((%����Ց�С���͝	�̰�Ȱ���ɽ٥��ȹ�ɕ�ѕ������ɽ٥��Ȉ����%�M�ɥ�����(%��ͭA%-�䠙��(%�Չ���Aɽ٥��Ȁ�􁍅���������Aɽ٥�����I�����͔����(%�ɥѕ)M=8�ܰ������Mх���
+ɕ�ѕ����Չ���Aɽ٥��Ȥ)�()�չ������Aɽ٥����!�����Ȥ���������Aɽ٥��ȡ܁�����I�����͕]ɥѕȰ�Ȁ������I��Օ�Ф��(%�����������Ʌ��1������Ȥ(%������Ȁ���ե��A��͔�ȹA�ѡY��Ք�������(%�����Ȁ�􁹥���($%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝%�م���%����ɽ٥��Ȉ���($%ɕ��ɸ(%�((%�����Ȁ�􁠹�ѽɔ���Aɽ٥��ȡȹ
+��ѕ�Р������(%�����Ȁ�􁹥���($%�ɥѕ)M=8�ܰ������Mх���9���չ������m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝9���չ�����ɽ٥��Ȉ�����M�ɥ�������($%ɕ��ɸ(%�((%��ͭA%-����(%�Չ���Aɽ٥��Ȁ�􁍅���������Aɽ٥�����I�����͔���(%�ɥѕ)M=8�ܰ������Mх���=,���Չ���Aɽ٥��Ȥ)�()�չ������Aɽ٥����!�����Ȥ�������I��������Aɽ٥��ȡ܁�����I�����͕]ɥѕȰ�Ȁ������I��Օ�Ф��(%�����������Ʌ��1������Ȥ(%������Ȁ���ե��A��͔�ȹA�ѡY��Ք�������(%�����Ȁ�􁹥���($%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝%�م���%����ɽ٥��Ȉ���($%ɕ��ɸ(%�((%مȁɕā���ՍЁ�($%Y�ɥ�䁉������ͽ��ٕɥ�䉀(%�(%���ȹ	��䀄􁹥�����ȹ	��䀄�����9�	��䀘��ȹ
+��ѕ��1���Ѡ������($%�����Ȁ��ͽ��9�������ȡ�����5��	�ѕ�I����ȡܰ�ȹ	��䰀���������������ɕĤ쁕�Ȁ�􁹥���($$%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝%�م���)M=8���($$%ɕ��ɸ($%�($%���ɕĹY�ɥ���($$%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝%�م���I��Օ�а��ٕɥ�䁥́��Ё������ѕ����ɕ�������쁍�����ɽ٥��ȁٕɥ��͕��Ʌѕ�䈥��($$%ɕ��ɸ($%�(%�((%�����Ȁ�􁠹�ѽɔ���Aɽ٥��ȡȹ
+��ѕ�Р������(%�����Ȁ�􁹥���($%�ɥѕ)M=8�ܰ������Mх���9���չ������m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝9���չ�����ɽ٥��Ȉ�����M�ɥ�������($%ɕ��ɸ(%�((%������ɽ٥���I����􁹥���($%���ɽ٥���I���U�ɕ���ѕ���Q����С��Q�����%����9����(%�((%�х��̀�􀉑�ͅ�����(%ɕ������U���ѕ���􁙅�͔(%�������������($%�ݥэ����ɕ���ѕ�%�5���������($%��͔��ɽ٥���Iչѥ��I����ѕɕ��($$%�х��̀�ɕ������ѕ��($$%ɕ������U���ѕ�����Ք($%����ձ��($$%�х��̀􀉹��}ɕ���ѕɕ��($%�(%�(%�����%�م����ѕ���􁠹����Aɽ٥���
+����%�م����є�ȹ
+��ѕ�Р�����Q�����%����9����(%����Ց�С���͝	�̰�Ȱ���ɽ٥��ȹɕ������ѕ������ɽ٥��Ȉ����%�M�ɥ�����((%��ͭA%-����(%�Չ���Aɽ٥��Ȁ�􁍅���������Aɽ٥�����I�����͔���(%�ɥѕ)M=8�ܰ������Mх���=,�����m��ɥ��u����($$��х��̈耀�����������х��̰($$��ɽ٥��Ȉ耀���������Չ���Aɽ٥��Ȱ($$�ɕ������}����ѕ��老ɕ������U���ѕ��($$������}��م����ѕ��聍����%�م����ѕ��(%��)�()�չ������Aɽ٥����!�����Ȥ�������U���ѕAɽ٥��ȡ܁�����I�����͕]ɥѕȰ�Ȁ������I��Օ�Ф��(%�����������Ʌ��1������Ȥ(%������Ȁ���ե��A��͔�ȹA�ѡY��Ք�������(%�����Ȁ�􁹥���($%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝%�م���%����ɽ٥��Ȉ���($%ɕ��ɸ(%�((%مȁ����ѕ́���m��ɥ��u���(%�����Ȁ��ͽ��9�������ȡ�����5��	�ѕ�I����ȡܰ�ȹ	��䰀�������������������ѕ̤쁕�Ȁ�􁹥���($%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝%�م���)M=8���($%ɕ��ɸ(%�(($���Y�����є�������������������ѕ�(%������������������ѕ�l������t쁽���($%���̰�|��􁹅������ɥ���쀅��Y����M�՜�̤��($$%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝%�م���M�՜�����������($$%ɕ��ɸ($%�(%�(($���M�ɥ����ͭ���A$���䃊P�����Ё�ٕ��ɥє�ɕ���م�Ք�ݥѠ������(%������-�䰁���������ѕ�l����}���t쁽���($%���̰�|�����-�両��ɥ����̀�􀈨�������̀�􀈈��($$%����є�����ѕ̰�����}��䈤($%�(%�(($������ݱ���聽�����ɵ�Ё���ݸ��ɽ٥��ȁ���յ�̸(%����ѕ̀􁙥�ѕ����ݕ�-��̡����ѕ̰��ɽ٥������ݕ�����̤((%���ɕ��Aɽ٥��Ȱ���Ȁ�􁠹�ѽɔ���Aɽ٥��ȡȹ
+��ѕ�Р������(%�����Ȁ�􁹥���($%�ɥѕ)M=8�ܰ������Mх���9���չ������m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝9���չ�����ɽ٥��Ȉ�����M�ɥ�������($%ɕ��ɸ(%�((%�������є��􀩍��ɕ��Aɽ٥���(%������������������ѕ�l������t����ɥ���쁽�����������􀈈��($%�������є�9����􁹅��(%�(%������-�䰁���������ѕ�l����}���t����ɥ���쁽���($%�������є�A%-�����-��(%�(%������	�͔�����������ѕ�l����}��͔�t����ɥ���쁽���($%�������є�A%	�͔����	�͔(%�(%���������������������ѕ�l���������t�������쁽���($%�������є��������􁕹�����(%�(%����������9��������������ѕ�l��������}�����t����ɥ���쁽���($%�������є�������9����􁑥�����9���(%�(%����а����������ѕ�l��ɽ٥���}�����t����ɥ���쁽������Ѐ�􀈈��($%�Ѐ��ѽɔ�9�ɵ����Aɽ٥���Q�����Ф($%����ѕ�l��ɽ٥���}�����t����($%�������є�Aɽ٥���Q�������(%�(%���͕�ѥ��̰����������ѕ�l�͕�ѥ��̉t쁽���($%Ʌ�M��ѥ��̰���Ȁ�􁵅�͡��)M=9I�ܡ͕�ѥ��̤($%�����Ȁ�􁹥���($$%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝%�م���)M=8���($$%ɕ��ɸ($%�($%�������є�M��ѥ��̀�Ʌ�M��ѥ���($%����ѕ�l�͕�ѥ��̉t��Ʌ�M��ѥ���(%�(($���I��م����є�UI1́������Ёѡ������ͥ��䁹�ܤ��ɽ٥��ȁ�����($���]�����ɽ٥���}�����������̰����ѥ������}��͔����Ё��ͼ����́م����ѥ��($�����ȁѡ����܁������P��ɕٕ��́MMI�٥��
+C�I����
+@�������ݥэ��(%����
+��������􁍅�����є�Aɽ٥���Q��������ɕ��Aɽ٥��ȹAɽ٥���Q���((%������	�͔�����������ѕ�l����}��͔�t쁽���($%���̰�|�����	�͔����ɥ����̀�􀈈��($$%�����Ȁ��م����ѕAɽ٥���UI0�̰��������є�Aɽ٥���Q����쁕�Ȁ�􁹥���($$$%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聕�ȹ�ɽȠ���($$$%ɕ��ɸ($$%�($%�(%􁕱͔��������
+�����������������є�A%	�͔��􀈈��($%�����Ȁ��م����ѕAɽ٥���UI0��������є�A%	�͔���������є�Aɽ٥���Q����쁕�Ȁ�􁹥���($$%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聕�ȹ�ɽȠ���($$%ɕ��ɸ($%�(%�(%�����͕UI0�����������ѕ�l���͕}�ɰ�t쁽���($%���̰�|��􁉅͕UI0����ɥ����̀�􀈈��($$%�����Ȁ��م����ѕAɽ٥���UI0�̰��������є�Aɽ٥���Q����쁕�Ȁ�􁹥���($$$%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聕�ȹ�ɽȠ���($$$%ɕ��ɸ($$%�($%�(%�(($���9�ɵ���锁=��������͔�UI0�Ѽ�����Ց����āͼ������������ѡ́�͔�ѡ��ͅ���م�Ք�(%��ɵ����=�����A%	�͔���������є�(%����������є�A%	�͔�����ɕ��Aɽ٥��ȹA%	�͔��($%����ѕ�l����}��͔�t�􁍅�����є�A%	�͔(%�((%�����Ȁ��م����ѕ
+���AQ=�ѡAɽ٥���
+������є�ȹ
+��ѕ�Р������ѽɔ��������������є�쁕�Ȁ�􁹥���($%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聕�ȹ�ɽȠ���($%ɕ��ɸ(%�(%�����Ȁ��م����ѕAɽ٥�����������M��ѥ��̠��������є�쁕�Ȁ�􁹥���($%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝%�م���I��Օ�а���ȹ�ɽȠ����($%ɕ��ɸ(%�(($���QɅ����������������ɔ�����є���ȁɕ�����䁍������(%مȁ���9������ɥ��(%������ɽ٥���I����􁹥���($%���9�������ɕ��Aɽ٥��ȹ9���(%�((%�����Ȁ�􁠹�ѽɔ�U���ѕAɽ٥��ȡȹ
+��ѕ�Р�����������ѕ̤쁕�Ȁ�􁹥���($%ͱ����ɽȠ��ɽ٥���̹����є������ɽȈ����Ȥ($%�ɥѕ)M=8�ܰ������Mх���%�ѕɹ��M��ٕ��ɽȰ����m��ɥ��u��ɥ��쉕�ɽȈ聕�ȹ�ɽȠ���($%ɕ��ɸ(%�(($���M幌����������ɕ������ݥѠ�����ѕ���ɽ٥���(%������ɽ٥���I����􁹥���($%�������ѕ�����Ȁ�􁠹�ѽɔ���Aɽ٥��ȡȹ
+��ѕ�Р������쁕�Ȁ�􁹥���($$$���U�ɕ���ѕȁ������������ɕ������Ѽ��ɕٕ�Ё����Ё���ɥ��($$%������9�����􀈈�������9����������ѕ��9�����($$$%���ɽ٥���I���U�ɕ���ѕ���Q����С����ѕ��Q�����%�����9����($$%�($$%��������ѕ����������($$$%���ɽ٥���I���U�ɕ���ѕ���Q����С����ѕ��Q�����%������ѕ��9����($$%􁕱͔��($$$%��ɕ���ѕ�%�5���������ѕ��($$%�($%�(%�(($���9�ѥ���Չ͍ɥ���̀������
+@�ɔ�ɕ����Ʌѥ��������Ёѡ��������(%�������ѕ�����Ȁ�􁠹�ѽɔ���Aɽ٥��ȡȹ
+��ѕ�Р������쁕�Ȁ�􁹥���($%������Aɽ٥���
+����%�م����є�ȹ
+��ѕ�Р�������ѕ��Q�����%������ѕ��9����($%������9�����􀈈�������9����������ѕ��9�����($$%������Aɽ٥���
+����%�م����є�ȹ
+��ѕ�Р�������ѕ��Q�����%�����9����($%�(%�((%����Ց�С���͝	�̰�Ȱ���ɽ٥��ȹ����ѕ������ɽ٥��Ȉ�����M�ɥ�����(%�ɥѕ)M=8�ܰ������Mх���=,�����m��ɥ��u��ɥ����х��̈耉����ѕ����)�()�չ������Aɽ٥����!�����Ȥ����������ѕAɽ٥��ȡ܁�����I�����͕]ɥѕȰ�Ȁ������I��Օ�Ф��(%�����������Ʌ��1������Ȥ(%������Ȁ���ե��A��͔�ȹA�ѡY��Ք�������(%�����Ȁ�􁹥���($%�ɥѕ)M=8�ܰ������Mх���	��I��Օ�а����m��ɥ��u��ɥ��쉕�ɽȈ聤�ḹP�����������ḹ5͝%�م���%����ɽ٥��Ȉ���($%ɕ��ɸ(%�(($���I�����ɽ٥��ȁ����ɔ�����ѥ���ͼ�ݔ�����չɕ���ѕȁ��(%مȁ�ɽ٥���9������ɥ��(%مȁ�ɽ٥���Q�����%��ե��UU%(%��������Ȁ�􁠹�ѽɔ���Aɽ٥��ȡȹ
+��ѕ�Р������쁕�Ȁ�􁹥���($%�ɽ٥���9�������9���($%�ɽ٥���Q�����%����Q�����%(%�((%�����Ȁ�􁠹�ѽɔ����ѕAɽ٥��ȡȹ
+��ѕ�Р������쁕�Ȁ�􁹥���($%ͱ����ɽȠ��ɽ٥���̹����є������ɽȈ����Ȥ($%�ɥѕ)M=8�ܰ������Mх���%�ѕɹ��M��ٕ��ɽȰ����m��ɥ��u��ɥ��쉕�ɽȈ聕�ȹ�ɽȠ���($%ɕ��ɸ(%�((%������ɽ٥���I����􁹥������ɽ٥���9�����􀈈��($%���ɽ٥���I���U�ɕ���ѕ���Q����С�ɽ٥���Q�����%���ɽ٥���9����(%�(%����ɽ٥���9�����􀈈��($%������Aɽ٥���
+����%�م����є�ȹ
+��ѕ�Р����ɽ٥���Q�����%���ɽ٥���9����(%�((%����Ց�С���͝	�̰�Ȱ���ɽ٥��ȹ����ѕ������ɽ٥��Ȉ�����M�ɥ�����(%�ɥѕ)M=8�ܰ������Mх���=,�����m��ɥ��u��ɥ����х��̈耉����ѕ����)�(
